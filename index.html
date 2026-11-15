@@ -53,6 +53,8 @@ input{background:#070a1a;color:var(--fg);border:1px solid var(--ln);border-radiu
 #joinRow input{flex:1;text-transform:uppercase}
 #mpStatus{font-size:12px;opacity:.8;min-height:1.2em}
 #roomCode{font-size:20px;letter-spacing:4px;color:var(--ac);font-weight:bold}
+.station-panel{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:var(--pn);border:1px solid var(--ln);border-radius:12px;padding:14px;display:flex;gap:18px;max-width:92vw;max-height:80vh;overflow:auto;z-index:100}
+.station-panel h3{margin:0 0 8px;font-size:14px;color:var(--ac)}
 </style>
 </head>
 <body>
@@ -64,7 +66,19 @@ input{background:#070a1a;color:var(--fg);border:1px solid var(--ln);border-radiu
   <button id="bMenu">메뉴</button>
 </div>
 <div id="hotbar"></div>
-<div id="panel" hidden><div><h3>가방</h3><div id="grid"></div></div><div><h3>장비</h3><div id="eq"><div id="eqL"></div><canvas id="pv" width="72" height="120"></canvas><div id="eqR"></div></div><div id="stat"></div></div><div><h3>제작</h3><div id="recipes"></div></div></div>
+<div id="panel" hidden><div><h3>가방</h3><div id="grid"></div></div><div><h3>장비</h3><div id="eq"><div id="eqL"></div><canvas id="pv" width="72" height="120"></canvas><div id="eqR"></div></div><div id="stat"></div></div><div><h3>기본 제작</h3><div id="recipes"></div></div></div>
+<div id="benchPanel" class="station-panel" hidden>
+  <div><h3>🔨 작업대</h3><div id="benchGrid"></div></div>
+  <div><h3>제작</h3><div id="benchRecipes"></div></div>
+</div>
+<div id="furnPanel" class="station-panel" hidden>
+  <div><h3>🔥 화로</h3><div id="furnGrid"></div></div>
+  <div><h3>제련</h3><div id="furnRecipes"></div></div>
+</div>
+<div id="chestPanel" class="station-panel" hidden>
+  <div><h3>📦 상자</h3><div id="chestGrid"></div></div>
+  <div><h3>가방</h3><div id="chestInvGrid"></div></div>
+</div>
 <div id="toast"></div>
 <div id="chat"></div>
 <div id="chatInput" hidden><input id="chatBox" placeholder="메시지 입력 후 Enter" maxlength="80"></div>
@@ -85,7 +99,7 @@ input{background:#070a1a;color:var(--fg);border:1px solid var(--ln);border-radiu
   <div id="mpStatus"></div>
   <div id="roomCode" hidden></div>
 </div>
-<small>A/D 이동 · W/Space 점프 · 좌클릭 채굴 · 우클릭 설치<br>1~0·휠 슬롯 선택 · E 가방/제작 · F 양손 교체 · Q 왼손에 들기<br>K 저장 · Esc 메뉴 · T 채팅 · 📍 로케이터 (멀티플레이)</small>
+<small>A/D 이동 · W/Space 점프 · 좌클릭 채굴 · 우클릭 설치/설치물 상호작용<br>1~0·휠 슬롯 선택 · E 가방/기본제작 · F 양손 교체 · Q 왼손에 들기<br>작업대/화로/상자 우클릭으로 UI 열기 · K 저장 · Esc 메뉴 · T 채팅</small>
 </div></div>
 <script>
 'use strict';
@@ -93,19 +107,19 @@ input{background:#070a1a;color:var(--fg);border:1px solid var(--ln);border-radiu
 /* ============ 0. 멀티플레이 (PeerJS P2P, 호스트 권한) ============ */
 const MP = {
   peer: null,
-  conns: new Map(),      // host: peerId -> DataConnection
-  hostConn: null,        // client: host connection
+  conns: new Map(),
+  hostConn: null,
   isHost: false,
   roomCode: null,
   myName: 'P' + (Math.random()*900+100|0),
-  remotes: new Map(),    // peerId -> remote player state (host는 자기 자신 제외)
+  remotes: new Map(),
   active: false,
   lastSend: 0,
   inputMode: false,
-  selfId: null
+  selfId: null,
+  locate: true
 };
 
-// peerId 해시 → 0~359 색상
 function pidHue(id) {
   if (!id) return 200;
   let h = 0;
@@ -139,11 +153,14 @@ function mpSendToHost(obj) {
 
 function mpPackWorld() {
   sync();
+  const chests = [];
+  for (const [k, v] of CHESTS) chests.push([k, v]);
   return {
     seed, time, sel, dim,
     port: PORT,
     p: [P.x, P.y],
     inv, eq,
+    chests,
     w0: { rle: rle(DIM[0].world), wl: rle(DIM[0].wl), hs: DIM[0].heights },
     w1: DIM[1] ? { rle: rle(DIM[1].world), wl: rle(DIM[1].wl), hs: DIM[1].heights } : null
   };
@@ -161,6 +178,8 @@ function mpApplyWorld(d) {
   inv.splice(0, inv.length, ...d.inv);
   for (const k in eq) eq[k] = null;
   Object.assign(eq, d.eq);
+  CHESTS.clear();
+  for (const [k, v] of (d.chests || [])) CHESTS.set(k, v);
   scanTorches();
   Object.assign(P, { x: d.p[0], y: d.p[1], vx: 0, vy: 0 });
   dirty = true;
@@ -202,7 +221,6 @@ function mpHost() {
     conn.on('open', () => {
       MP.conns.set(conn.peer, conn);
       if (!MP.remotes.has(conn.peer)) MP.remotes.set(conn.peer, { name: '플레이어', x: 0, y: 0, face: 1, sw: null, swT: 0, swId: 0, last: 0 });
-      // 신규에게 전체 월드 + 현재 접속자 목록 전송
       const players = [];
       for (const [pid, r] of MP.remotes) if (pid !== conn.peer) players.push({ id: pid, name: r.name, x: r.x, y: r.y });
       try { conn.send(mpMsg('init', { world: mpPackWorld(), name: MP.myName, hostId: MP.selfId, players })); } catch(e){}
@@ -230,9 +248,7 @@ function mpJoin(code) {
     MP.selfId = id;
     const conn = MP.peer.connect('aether-' + code, { reliable: true });
     MP.hostConn = conn;
-    conn.on('open', () => {
-      mpSendToHost({ t: 'hello', d: { name: MP.myName } });
-    });
+    conn.on('open', () => { mpSendToHost({ t: 'hello', d: { name: MP.myName } }); });
     conn.on('data', raw => mpHandleClient(raw));
     conn.on('close', () => {
       mpStatus('호스트와 연결이 끊겼습니다.');
@@ -241,13 +257,9 @@ function mpJoin(code) {
     });
     conn.on('error', () => mpStatus('연결 실패. 코드를 확인하세요.'));
   });
-  MP.peer.on('error', err => {
-    mpStatus('오류: ' + err.type);
-    MP.active = false;
-  });
+  MP.peer.on('error', err => { mpStatus('오류: ' + err.type); MP.active = false; });
 }
 
-// ★ 호스트 수신
 function mpHandleHost(conn, raw) {
   let m; try { m = JSON.parse(raw); } catch(e){ return; }
   const id = conn.peer;
@@ -256,9 +268,7 @@ function mpHandleHost(conn, raw) {
       const name = m.d.name || '플레이어';
       if (MP.remotes.has(id)) MP.remotes.get(id).name = name;
       else MP.remotes.set(id, { name, x: 0, y: 0, face: 1, sw: null, swT: 0, swId: 0, last: 0 });
-      // 기존 플레이어들에게 신규 알림 (신규 제외)
       mpBroadcast({ t: 'join', d: { id, name } }, id);
-      // 신규에게 호스트 자신 정보 전달
       try { conn.send(mpMsg('pos', { id: MP.selfId, name: MP.myName, x: P.x, y: P.y, face: P.face, sw: null, swT: 0, swId: 0 })); } catch(e){}
       addChat('시스템', `${name} 님이 접속했습니다.`);
       mpStatus(`접속자 ${MP.conns.size + 1}명 (본인 포함)`);
@@ -266,21 +276,17 @@ function mpHandleHost(conn, raw) {
     }
     case 'pos': {
       const r = MP.remotes.get(id);
-      if (r) { Object.assign(r, m.d, { last: performance.now() }); }
-      // ★ 발신자 제외 브로드캐스트
+      if (r) Object.assign(r, m.d, { last: performance.now() });
       mpBroadcast({ t: 'pos', d: { id, ...m.d } }, id);
       break;
     }
     case 'break': {
-      // ★ 서버 권한: 실제로 그 타일이 존재하는지 검증 후 적용
       const { x, y } = m.d;
       if (x < 0 || x >= W || y < 0 || y >= H) break;
       const i = y * W + x, tid = world[i];
       if (!tid) break;
       const origTile = tid;
-      // 파괴 적용 (호스트 로컬)
       breakTile(x, y);
-      // ★ 발신자 제외 브로드캐스트 (발신자는 이미 로컬에서 예측 파괴함)
       mpBroadcast({ t: 'break', d: { x, y, tile: origTile } }, id);
       break;
     }
@@ -289,9 +295,18 @@ function mpHandleHost(conn, raw) {
       if (x < 0 || x >= W || y < 0 || y >= H) break;
       const i = y * W + x;
       if (wlv !== undefined) { wl[i] = wlv; }
-      else { world[i] = tile; if (tile === TORCH) TL.add(i); }
-      // ★ 발신자 제외 브로드캐스트
+      else {
+        world[i] = tile;
+        if (tile === TORCH) TL.add(i);
+        if (tile === CHEST) { const key = x + ',' + y; if (!CHESTS.has(key)) CHESTS.set(key, Array(27).fill(null)); }
+      }
       mpBroadcast({ t: 'place', d: { x, y, tile: world[i], wl: wlv } }, id);
+      break;
+    }
+    case 'chest': {
+      // 상자 내용 동기화
+      CHESTS.set(m.d.key, m.d.items);
+      mpBroadcast({ t: 'chest', d: m.d }, id);
       break;
     }
     case 'chat': {
@@ -303,23 +318,17 @@ function mpHandleHost(conn, raw) {
   }
 }
 
-// ★ 클라이언트 수신
 function mpHandleClient(raw) {
   let m; try { m = JSON.parse(raw); } catch(e){ return; }
   switch (m.t) {
     case 'init': {
       mpApplyWorld(m.d.world);
       if (m.d.hostId) MP.hostId = m.d.hostId;
-      // 호스트 자신을 remotes에 등록
       if (m.d.hostId) {
-        MP.remotes.set(m.d.hostId, {
-          name: '호스트', x: P.x, y: P.y, face: 1, sw: null, swT: 0, swId: 0, last: performance.now()
-        });
+        MP.remotes.set(m.d.hostId, { name: '호스트', x: P.x, y: P.y, face: 1, sw: null, swT: 0, swId: 0, last: performance.now() });
       }
       for (const p of (m.d.players || [])) {
-        if (p.id !== MP.selfId && p.id !== m.d.hostId) {
-          MP.remotes.set(p.id, { name: p.name, x: p.x, y: p.y, face: 1, last: performance.now() });
-        }
+        if (p.id !== MP.selfId && p.id !== m.d.hostId) MP.remotes.set(p.id, { name: p.name, x: p.x, y: p.y, face: 1, last: performance.now() });
       }
       toast('방에 접속했습니다.');
       mpStatus('접속됨 (호스트: ' + MP.roomCode + ')');
@@ -343,6 +352,7 @@ function mpHandleClient(raw) {
       const i = m.d.y * W + m.d.x;
       world[i] = AIR;
       if (m.d.tile === TORCH) TL.delete(i);
+      if (m.d.tile === CHEST) CHESTS.delete(m.d.x + ',' + m.d.y);
       break;
     }
     case 'place': {
@@ -351,9 +361,14 @@ function mpHandleClient(raw) {
       else {
         world[i] = m.d.tile;
         if (m.d.tile === TORCH) TL.add(i);
+        if (m.d.tile === CHEST) { const key = m.d.x + ',' + m.d.y; if (!CHESTS.has(key)) CHESTS.set(key, Array(27).fill(null)); }
       }
       break;
     }
+    case 'chest':
+      CHESTS.set(m.d.key, m.d.items);
+      if (chestOpenKey === m.d.key) renderChestUI();
+      break;
     case 'chat':
       addChat(m.d.name, m.d.text);
       break;
@@ -366,11 +381,8 @@ function mpTick(dt) {
   if (MP.lastSend < 0.05) return;
   MP.lastSend = 0;
   const payload = { x: P.x, y: P.y, face: P.face, sw: P.sw, swT: P.swT, swId: P.swId || 0, dim };
-  if (MP.isHost) {
-    mpBroadcast({ t: 'pos', d: { id: MP.selfId, name: MP.myName, ...payload } });
-  } else {
-    mpSendToHost({ t: 'pos', d: payload });
-  }
+  if (MP.isHost) mpBroadcast({ t: 'pos', d: { id: MP.selfId, name: MP.myName, ...payload } });
+  else mpSendToHost({ t: 'pos', d: payload });
 }
 
 function addChat(name, text) {
@@ -383,10 +395,21 @@ function addChat(name, text) {
   while (c.children.length > 8) c.firstChild.remove();
 }
 
+// ★ 상자 동기화 헬퍼 (호스트/클라 공통)
+function syncChest(key) {
+  const items = CHESTS.get(key);
+  if (!items) return;
+  if (MP.active) {
+    if (MP.isHost) mpBroadcast({ t: 'chest', d: { key, items } });
+    else mpSendToHost({ t: 'chest', d: { key, items } });
+  }
+}
+
 /* ============ 1. 설정 / 데이터 ============ */
 const W=500,H=220,SEA=62,GRAV=50,JUMP=19,SPEED=8.5,REACH=5.5,DAY=240;
 const AIR=0,GRASS=1,DIRT=2,STONE=3,SAND=4,SNOW=5,LOG=6,LEAF=7,COPPER=8,IRON=9,CRYSTAL=10,PLANK=11,BED=12,FURN=13,BENCH=14,SLAB=15,STAIRR=16,STAIRL=17,DOORC=18,DOORO=19,TRAPC=20,TRAPO=21,LADDER=22,WALLW=23;
 const [BLOG,BLEAF,SLOG,SLEAF,JLOG,JLEAF,ALOG,ALEAF,ELOG,ELEAF,COAL,SILVER,GOLD,EMERALD,DIAMOND,MITHRIL,TORCH,WATER,PORTAL,AGRASS,ASTONE,JGRASS,MUD,SAVGRASS,AORE]=Array.from({length:25},(_,i)=>24+i);
+const CHEST = 49;
 const SC=['#82858f','#767983'];
 const TILES=[{},
  {n:'잔디',c:['#4fa13c','#468f35'],s:1,h:.5,r:1,d:DIRT},
@@ -422,6 +445,8 @@ TILES.push(LG('자작나무 원목','#e4e0d2','b'),LF('자작나무 잎','#8cbf4
  {n:'에테르 풀',c:['#7a5cf0'],s:1,h:.7,r:1,a:'g',g:['#5a3fc0','#8f7cff','#3a3466'],d:ASTONE},{n:'에테르 암',c:['#4a4470'],s:1,h:1.6,r:2,a:'s'},
  {n:'정글 풀',c:['#2f9a38'],s:1,h:.5,r:1,a:'g',g:['#1f7a2a','#34b83c','#4a3a2a'],d:MUD},{n:'진흙',c:['#4a3a2a'],s:1,h:.5,r:1},
  {n:'사바나 풀',c:['#b8a83a'],s:1,h:.5,r:1,a:'g',g:['#a89a2e','#cdbd4a','#7b5233'],d:DIRT},{...OR('에테르 광석','#ff7be8',4.5,7),c:['#4a4470']});
+// ★ 상자 타일 추가 (49번)
+TILES[CHEST] = {n:'상자',c:['#8a5a2b'],s:1,h:.8,r:1,a:'C'};
 const ART={[GRASS]:'g',[STONE]:'s',[COPPER]:'o',[IRON]:'o',[CRYSTAL]:'o',[LOG]:'l',[LEAF]:'f',[PLANK]:'p'};
 for(const k in ART)TILES[k].a=ART[k];
 TILES[LOG].t=TILES[PLANK].t='a';TILES[LOG].s=TILES[LEAF].s=1;TILES[LOG].lg=1;TILES[LEAF].lf=1;
@@ -430,13 +455,42 @@ const IT={150:{n:'구리 주괴',c:'#e0883f',pt:'bar'},151:{n:'철 주괴',c:'#d
 const BAR=[0,150,151,153,154,155];
 TT.forEach(([k,n],i)=>TIER.forEach(([tn,c,p,sp],j)=>IT[100+i*10+j]={n:tn+' '+n,c,p,sp,slot:k,pt:k}));
 AR.forEach(([n,sl,df],i)=>[1,2,3,4,5].forEach(j=>IT[200+i*10+j]={n:TIER[j][0]+' '+n,c:TIER[j][1],df:df+j,slot:sl,pt:sl}));
-const RECIPES=[{out:PLANK,n:4,in:{[LOG]:1}},{out:152,n:4,in:{[PLANK]:1}},{out:BENCH,n:1,in:{[PLANK]:10}},{out:FURN,n:1,in:{[STONE]:20,[PLANK]:4},st:BENCH},
- {out:SLAB,n:2,in:{[PLANK]:1},st:BENCH},{out:STAIRR,n:4,in:{[PLANK]:6},st:BENCH},{out:WALLW,n:4,in:{[PLANK]:1},st:BENCH},
- {out:DOORC,n:1,in:{[PLANK]:6},st:BENCH},{out:TRAPC,n:1,in:{[PLANK]:4},st:BENCH},{out:LADDER,n:4,in:{152:3},st:BENCH},
- {out:150,n:1,in:{[COPPER]:3},st:FURN},{out:151,n:1,in:{[IRON]:4},st:FURN},{out:153,n:1,in:{[SILVER]:4},st:FURN},{out:154,n:1,in:{[GOLD]:4},st:FURN},{out:155,n:1,in:{[MITHRIL]:5},st:FURN},
- {out:TORCH,n:4,in:{152:1,[COAL]:1}},{out:PORTAL,n:1,in:{[DIAMOND]:6,[EMERALD]:6,[CRYSTAL]:20,155:3},st:FURN}];
+
+// ★ 제작 규칙 재정의: st 필드 = 'basic'(기본, st 없음) / BENCH(작업대) / FURN(화로)
+const RECIPES=[
+  // 기본 제작 (E) — 막대기, 작업대, 나무 벽, 나무 반블록만
+  {out:152,n:4,in:{[PLANK]:1}},
+  {out:BENCH,n:1,in:{[PLANK]:10}},
+  {out:WALLW,n:4,in:{[PLANK]:1}},
+  {out:SLAB,n:2,in:{[PLANK]:1}},
+  // 판자도 기본에 (통나무→판자 없으면 아무것도 못 만듦)
+  {out:PLANK,n:4,in:{[LOG]:1}},
+  // 작업대 전용
+  {out:STAIRR,n:4,in:{[PLANK]:6},st:BENCH},
+  {out:DOORC,n:1,in:{[PLANK]:6},st:BENCH},
+  {out:TRAPC,n:1,in:{[PLANK]:4},st:BENCH},
+  {out:LADDER,n:4,in:{152:3},st:BENCH},
+  {out:CHEST,n:1,in:{[PLANK]:8},st:BENCH},
+  {out:TORCH,n:4,in:{152:1,[COAL]:1},st:BENCH},
+  // 화로 전용
+  {out:FURN,n:1,in:{[STONE]:20,[PLANK]:4},st:FURN},
+  {out:150,n:1,in:{[COPPER]:3},st:FURN},
+  {out:151,n:1,in:{[IRON]:4},st:FURN},
+  {out:153,n:1,in:{[SILVER]:4},st:FURN},
+  {out:154,n:1,in:{[GOLD]:4},st:FURN},
+  {out:155,n:1,in:{[MITHRIL]:5},st:FURN},
+  {out:PORTAL,n:1,in:{[DIAMOND]:6,[EMERALD]:6,[CRYSTAL]:20,155:3},st:FURN}
+];
+// 작업대 도구
 TT.forEach((_,i)=>TIER.forEach((_,j)=>RECIPES.push({out:100+i*10+j,n:1,in:j?{[BAR[j]]:[5,4,6][i],152:2}:{[PLANK]:6,152:2},st:j?FURN:BENCH})));
+// 화로 방어구
 AR.forEach((_,i)=>[1,2,3,4,5].forEach(j=>RECIPES.push({out:200+i*10+j,n:1,in:{[BAR[j]]:[6,8,7][i]},st:FURN})));
+
+// 분류
+const BASIC_RECIPES = RECIPES.filter(r => !r.st);
+const BENCH_RECIPES = RECIPES.filter(r => r.st === BENCH);
+const FURN_RECIPES = RECIPES.filter(r => r.st === FURN);
+
 const BIOME=['숲','사막','설원','평원','사바나','정글','바다','자작나무 숲','가문비나무 숲'];
 const nm=id=>(TILES[id]||IT[id]).n;
 
@@ -451,6 +505,10 @@ const mix=(a,b,t)=>`rgb(${a.map((v,i)=>v+(b[i]-v)*t|0)})`;
 
 /* ============ 3. 월드 / 바이옴 / 차원 ============ */
 let world=null,wl=null,heights=[],dim=0,portalCD=0;const DIM=[null,null],PORT=[null,null],TL=new Set();
+// ★ 상자 데이터: key="x,y" -> Array(27) of {id,n}|null
+const CHESTS = new Map();
+let chestOpenKey = null;
+
 const getT=(x,y)=>x<0||x>=W||y<0||y>=H?0:world[y*W+x];
 const FULL=[[0,0,1,1]],NONE=[];
 const boxes=(x,y)=>x<0||x>=W||y>=H?FULL:y<0?NONE:TILES[world[y*W+x]].s?TILES[world[y*W+x]].bx||FULL:NONE;
@@ -471,7 +529,7 @@ function tree(x,gy,lg,lf,shape,R){
   else{const q=shape==='j'?3:2;for(let dy=-q;dy<=1;dy++)for(let dx=-q;dx<=q;dx++)if(Math.abs(dx)+Math.abs(dy)<=q+1)put(x+dx,top+dy)}}
 
 function generate(sd){
-  seed=sd|0;world=new Uint8Array(W*H);wl=new Uint8Array(W*H);heights=[];dim=0;DIM[0]=DIM[1]=null;PORT[0]=PORT[1]=null;const R=mulberry32(seed*7+1);
+  seed=sd|0;world=new Uint8Array(W*H);wl=new Uint8Array(W*H);heights=[];dim=0;DIM[0]=DIM[1]=null;PORT[0]=PORT[1]=null;CHESTS.clear();const R=mulberry32(seed*7+1);
   for(let x=0;x<W;x++){const k=kx(x),b=biomeAt(x);let h=SEA-8+(fbm(x/60,5)-.5)*40+(vn(x/12,1)-.5)*4;
     if(b===1||b===3)h=SEA-8+(h-SEA+8)*(b===1?.4:.55);
     heights[x]=Math.round(h+Math.max(clamp((60-k)/20,0,1),clamp((k-455)/20,0,1))*26)}
@@ -543,25 +601,58 @@ function addItem(id,n=1){dirty=true;for(const s of inv)if(s&&s.id===id&&!(IT[id]
   const i=inv.indexOf(null);if(i>=0)inv[i]={id,n}}
 function take(id,n){for(let i=0;i<inv.length&&n>0;i++){const s=inv[i];if(s&&s.id===id){const m=Math.min(n,s.n);s.n-=m;n-=m;if(!s.n)inv[i]=null}}dirty=true}
 const canCraft=r=>(!r.st||near(r.st))&&Object.entries(r.in).every(([k,n])=>count(+k)>=n);
-function craft(i){const r=RECIPES[i];if(!canCraft(r))return;for(const k in r.in)take(+k,r.in[k]);addItem(r.out,r.n);toast(nm(r.out)+' 제작 완료')}
+function craft(r){
+  if(!canCraft(r))return;
+  for(const k in r.in)take(+k,r.in[k]);
+  addItem(r.out,r.n);
+  toast(nm(r.out)+' 제작 완료');
+}
 
 /* ============ 6. 채굴 / 건축 / 양손 ============ */
 const mine={x:-1,y:-1,p:0};let hover={tx:0,ty:0,inR:false},placeCD=0;
 function breakTile(x,y){
-  const id=world[y*W+x],t=TILES[id];world[y*W+x]=AIR;addItem(t.d||id);if(id===TORCH)TL.delete(y*W+x);
-  if(t.dr)world[(y+(TILES[getT(x,y-1)].dr?-1:1))*W+x]=AIR}
+  const id=world[y*W+x],t=TILES[id];
+  if(id===CHEST) CHESTS.delete(x+','+y);
+  world[y*W+x]=AIR;
+  if(IT[id]||TILES[id]) addItem(t.d||id);
+  if(id===TORCH)TL.delete(y*W+x);
+  if(t.dr)world[(y+(TILES[getT(x,y-1)].dr?-1:1))*W+x]=AIR;
+  if(chestOpenKey===x+','+y) closeChest();
+}
 const TG={[DOORC]:DOORO,[DOORO]:DOORC,[TRAPC]:TRAPO,[TRAPO]:TRAPC};
 function swapHands(){[eq.R,eq.L]=[eq.L,eq.R];dirty=true;toast('양손을 교체했습니다')}
+
+// ★ 우클릭 상호작용 (설치물 열기)
+function tryInteractStation(tx, ty) {
+  const id = getT(tx, ty);
+  if (id === BENCH) { openBench(); return true; }
+  if (id === FURN) { openFurnace(); return true; }
+  if (id === CHEST) { openChest(tx, ty); return true; }
+  return false;
+}
+
 function interact(dt){
   const tx=Math.floor(cam.x+mouse.x/T),ty=Math.floor(cam.y+mouse.y/T),cx=P.x+P.w/2,cy=P.y+P.h/2;
   const inR=tx>=0&&tx<W&&ty>=0&&ty<H&&Math.hypot(tx+.5-cx,ty+.5-cy)<=REACH;
   hover={tx,ty,inR};const i=ty*W+tx,id=inR?world[i]:0,td=TILES[id],wall=inR&&!id?wl[i]:0,hard=id&&id!==WATER;
   const k=id?(td.t||'p'):'h';let dug=false;P.sw=null;placeCD-=dt;
+
   for(const [down,hk] of [[mouse.l,'R'],[mouse.r,'L']]){
-    if(!down||!inR)continue;const hs=eq[hk],hi=hs&&IT[hs.id];
+    if(!down||!inR)continue;
+
+    // ★ 우클릭으로 작업대/화로/상자 열기
+    if(hk === 'L' && (id === BENCH || id === FURN || id === CHEST)) {
+      if (placeCD <= 0) {
+        tryInteractStation(tx, ty);
+        placeCD = .3;
+      }
+      continue;
+    }
+
+    const hs=eq[hk],hi=hs&&IT[hs.id];
     if(hk==='L'&&TG[id]){if(placeCD<=0){const o=td.dr?(TILES[getT(tx,ty-1)].dr?-1:1):0;
         const was=hit(P.x,P.y,P.w,P.h);world[i]=TG[id];if(o)world[i+o*W]=TG[id];
-        if(!was&&hit(P.x,P.y,P.w,P.h)){world[i]=id;if(o)world[i+o*W]=id}else{placeCD=.25;if(!MP.active||MP.isHost)mpBroadcast({t:'place',d:{x:tx,y:ty,tile:world[i]}});else mpSendToHost({t:'place',d:{x:tx,y:ty,tile:world[i]}})}
+        if(!was&&hit(P.x,P.y,P.w,P.h)){world[i]=id;if(o)world[i+o*W]=id}else{placeCD=.25;if(MP.active){if(MP.isHost)mpBroadcast({t:'place',d:{x:tx,y:ty,tile:world[i]}});else mpSendToHost({t:'place',d:{x:tx,y:ty,tile:world[i]}})}}
         }continue}
     const s0=hs&&TILES[hs.id]?hs:hk==='L'&&!hs?inv[sel]:null,pl=s0&&TILES[s0.id]?s0:null;
     if(!pl&&(hard||wall)){
@@ -575,11 +666,13 @@ function interact(dt){
         if(hard){
           const bid=world[i];
           breakTile(tx,ty);
-          // ★ 로컬 예측 완료 → 서버에 알림 (브로드캐스트는 서버/호스트가)
           const msg={x:tx,y:ty,tile:bid};
           if(MP.active){ if(MP.isHost) mpBroadcast({t:'break',d:msg}); else mpSendToHost({t:'break',d:msg}); }
+        } else {
+          wl[i]=0;addItem(wall);
+          const msg={x:tx,y:ty,tile:0,wl:0};
+          if(MP.active){ if(MP.isHost) mpBroadcast({t:'place',d:msg}); else mpSendToHost({t:'place',d:msg}); }
         }
-        else{wl[i]=0;addItem(wall);if(MP.active){const msg={x:tx,y:ty,tile:0,wl:0};if(MP.isHost)mpBroadcast({t:'place',d:msg});else mpSendToHost({t:'place',d:msg})}}
         mine.x=-1;mine.p=0}
     }else if(pl&&!hard&&placeCD<=0){
       const it=TILES[pl.id],used=()=>{if(!--pl.n){if(pl===eq[hk])eq[hk]=null;else inv[sel]=null}dirty=true;placeCD=.12};
@@ -587,7 +680,14 @@ function interact(dt){
       else if([[1,0],[-1,0],[0,1],[0,-1]].some(([a,b])=>{const n=getT(tx+a,ty+b);return n&&n!==WATER})&&(!it.tall||(ty>0&&!getT(tx,ty-1)))){
         const was=hit(P.x,P.y,P.w,P.h);world[i]=pl.id===STAIRR&&P.face<0?STAIRL:pl.id;if(it.tall)world[i-W]=pl.id;
         if(!was&&hit(P.x,P.y,P.w,P.h)){world[i]=id;if(it.tall)world[i-W]=AIR}
-        else{if(pl.id===TORCH)TL.add(i);if(pl.id===PORTAL)PORT[dim]=[tx,ty];used();const msg={x:tx,y:ty,tile:world[i]};if(MP.active){if(MP.isHost)mpBroadcast({t:'place',d:msg});else mpSendToHost({t:'place',d:msg})}}}}
+        else{
+          if(pl.id===TORCH)TL.add(i);
+          if(pl.id===PORTAL)PORT[dim]=[tx,ty];
+          if(pl.id===CHEST){const key=tx+','+ty;if(!CHESTS.has(key))CHESTS.set(key,Array(27).fill(null));}
+          used();
+          const msg={x:tx,y:ty,tile:world[i]};
+          if(MP.active){if(MP.isHost)mpBroadcast({t:'place',d:msg});else mpSendToHost({t:'place',d:msg})}
+        }}}
   }
   if(!dug){mine.x=-1;mine.p=0}}
 function leafDecay(){
@@ -619,6 +719,8 @@ function art(id,v){
     else if(a==='P'){const dx=(x-7.5)/7.5,dy=((v?y+16:y)-16)/15.5,e=dx*dx+dy*dy;col=e>1?null:e>.7?'#c8b5ff':r>.95?'#fff':q>.5?'#6a3fe0':'#8a5cff'}
     else if(a==='F'){col=q<.3?dk:b;if(x>=4&&x<=11&&y>=6&&y<=13)col=y>9?(r>.5?'#ff8a2a':'#ffd04a'):'#1a1210'}
     else if(a==='B'){col=y>=4&&y<8?(y===4?lt:b):(x<3||x>12)&&y>=8?dk:null;if(y>=2&&y<4&&x>=3&&x<8&&r>.5)col='#cbd0d8'}
+    // ★ 상자 아트
+    else if(a==='C'){col=x<1||x>14||y<1||y>14?sh(b,.55):(y>=6&&y<=9?sh(b,.85):b);if(x>=2&&x<=13&&y>=2&&y<=5&&(x===4||x===8||x===11))col=sh(b,.7);if(x===7||x===8)col=y>=6&&y<=9?'#3a2a1a':col;if(r>.92&&y>1&&y<14)col=lt}
     else if(a==='p'||a==='W'){col=y%8===7?sh(b,.62):y%8===0?lt:R(x>>3,y,2)<.22?dk:b;if(x%13===1&&y%8===3)col=sh(b,.55);if(a==='W')col=sh(col,.55);
       if(m==='s'&&y<8||m==='r'&&y<8&&x<8||m==='l'&&y<8&&x>=8||m==='t'&&y>=4||m==='o'&&x>=3||m==='d'&&(x<5||x>10))col=null;
       if(m==='L')col=x===3||x===12?dk:y%5===2&&x>3&&x<12?b:null;
@@ -671,25 +773,19 @@ function render(){
   if(mine.p>0){ctx.fillStyle=`rgba(0,0,0,${mine.p*.55})`;ctx.fillRect((mine.x-cam.x)*T,(mine.y-cam.y)*T,T,T)}
   ctx.strokeStyle=hover.inR?'#fff':'rgba(255,90,90,.7)';ctx.lineWidth=2;
   ctx.strokeRect((hover.tx-cam.x)*T+1,(hover.ty-cam.y)*T+1,T-2,T-2);
-  // 원격 플레이어
   const now = performance.now();
   for (const [pid, r] of MP.remotes) {
     if (now - (r.last || 0) > 10000) continue;
     const x = (r.x - cam.x) * T, y = (r.y - cam.y) * T;
     if (x < -100 || y < -100 || x > cw + 100 || y > ch + 100) {
-      // 로케이터: 화면 밖 원격 플레이어 화살표
       if (MP.locate && r.x > 0) {
-        const cx = (r.x - cam.x) * T, cy = (r.y - cam.y) * T;
-        const sx = clamp(cx, 20, cw - 20), sy = clamp(cy, 20, ch - 20);
-        const ang2 = Math.atan2(cy - ch/2, cx - cw/2);
+        const cx2 = (r.x - cam.x) * T, cy2 = (r.y - cam.y) * T;
+        const sx = clamp(cx2, 20, cw - 20), sy = clamp(cy2, 20, ch - 20);
+        const ang2 = Math.atan2(cy2 - ch/2, cx2 - cw/2);
         const col = pidColors(pid);
-        ctx.save();
-        ctx.translate(sx, sy);
-        ctx.rotate(ang2);
-        ctx.fillStyle = col.name;
-        ctx.beginPath();
-        ctx.moveTo(10, 0); ctx.lineTo(-6, -6); ctx.lineTo(-6, 6); ctx.closePath();
-        ctx.fill();
+        ctx.save(); ctx.translate(sx, sy); ctx.rotate(ang2);
+        ctx.fillStyle = col.name; ctx.beginPath();
+        ctx.moveTo(10, 0); ctx.lineTo(-6, -6); ctx.lineTo(-6, 6); ctx.closePath(); ctx.fill();
         ctx.restore();
       }
       continue;
@@ -720,7 +816,6 @@ function drawRemote(c, x, y, w, h, r, pid, showLoc) {
     c.fillRect(x + w/2 - tw/2, y - 18, tw, 14);
     c.fillStyle = col.name;
     c.fillText(label, x + w/2, y - 8);
-    // 화살표 (플레이어 발 아래)
     c.fillStyle = col.name;
     c.beginPath();
     c.moveTo(x + w/2, y - 24); c.lineTo(x + w/2 - 5, y - 30); c.lineTo(x + w/2 + 5, y - 30); c.closePath();
@@ -745,31 +840,149 @@ function renderInv(){
   $('#hotbar').innerHTML=inv.slice(0,10).map((s,i)=>slotHTML(s,i,1)).join('');
   if(!panelOpen)return;renderEq();
   $('#grid').innerHTML=inv.map((s,i)=>slotHTML(s,i,i<10)).join('');
-  $('#recipes').innerHTML=RECIPES.map((r,i)=>`<button class="rc" data-r="${i}" ${canCraft(r)?'':'disabled'}>${icon(r.out)}<span><b>${nm(r.out)} ×${r.n}</b><br>${Object.entries(r.in).map(([k,n])=>nm(+k)+' '+n).join(', ')}${r.st?' · '+nm(r.st)+' 필요':''}</span></button>`).join('')}
+  $('#recipes').innerHTML=BASIC_RECIPES.map((r,i)=>`<button class="rc" data-r="${i}" ${canCraft(r)?'':'disabled'}>${icon(r.out)}<span><b>${nm(r.out)} ×${r.n}</b><br>${Object.entries(r.in).map(([k,n])=>nm(+k)+' '+n).join(', ')}</span></button>`).join('')}
 function renderEq(){
   const f=([k,l])=>`<div class="slot" data-e="${k}" title="${l}">${eq[k]?icon(eq[k].id):`<small>${l}</small>`}</div>`;
   $('#eqL').innerHTML=[['head','투구'],['body','갑옷'],['legs','각반'],['L','왼손']].map(f).join('');
   $('#eqR').innerHTML=[['p','곡괭이'],['a','도끼'],['h','망치'],['R','오른손']].map(f).join('');
   const pc=$('#pv').getContext('2d');pc.imageSmoothingEnabled=false;pc.clearRect(0,0,72,120);drawPlayer(pc,16,14,40,90,1,null);
-  $('#stat').innerHTML='🛡 방어력 '+defense()+'<br>가방에서 클릭=장착 · 장비칸 클릭=해제<br>빈 손칸 클릭=선택 아이템 들기'}
+  $('#stat').innerHTML='🛡 방어력 '+defense()+'<br>가방에서 클릭=장착 · 장비칸 클릭=해제'}
+
+// ★ 작업대 UI
+function renderBenchUI() {
+  $('#benchGrid').innerHTML = inv.map((s,i)=>slotHTML(s,i,i<10)).join('');
+  $('#benchRecipes').innerHTML = BENCH_RECIPES.map((r,i)=>`<button class="rc" data-br="${i}" ${canCraft(r)?'':'disabled'}>${icon(r.out)}<span><b>${nm(r.out)} ×${r.n}</b><br>${Object.entries(r.in).map(([k,n])=>nm(+k)+' '+n).join(', ')}</span></button>`).join('');
+}
+// ★ 화로 UI
+function renderFurnUI() {
+  $('#furnGrid').innerHTML = inv.map((s,i)=>slotHTML(s,i,i<10)).join('');
+  $('#furnRecipes').innerHTML = FURN_RECIPES.map((r,i)=>`<button class="rc" data-fr="${i}" ${canCraft(r)?'':'disabled'}>${icon(r.out)}<span><b>${nm(r.out)} ×${r.n}</b><br>${Object.entries(r.in).map(([k,n])=>nm(+k)+' '+n).join(', ')}</span></button>`).join('');
+}
+// ★ 상자 UI
+function renderChestUI() {
+  if (!chestOpenKey) return;
+  const items = CHESTS.get(chestOpenKey);
+  if (!items) return;
+  $('#chestGrid').innerHTML = items.map((s,i)=>`<div class="slot" data-ci="${i}">${s?icon(s.id)+(s.n>1?`<b>${s.n}</b>`:''):''}</div>`).join('');
+  $('#chestInvGrid').innerHTML = inv.map((s,i)=>slotHTML(s,i,i<10)).join('');
+}
+
+function openBench() {
+  closeAllStations();
+  $('#benchPanel').hidden = false;
+  panelOpen = false; $('#panel').hidden = true;
+  renderBenchUI();
+}
+function openFurnace() {
+  closeAllStations();
+  $('#furnPanel').hidden = false;
+  panelOpen = false; $('#panel').hidden = true;
+  renderFurnUI();
+}
+function openChest(tx, ty) {
+  closeAllStations();
+  const key = tx + ',' + ty;
+  if (!CHESTS.has(key)) CHESTS.set(key, Array(27).fill(null));
+  chestOpenKey = key;
+  $('#chestPanel').hidden = false;
+  panelOpen = false; $('#panel').hidden = true;
+  renderChestUI();
+}
+function closeChest() {
+  chestOpenKey = null;
+  $('#chestPanel').hidden = true;
+}
+function closeAllStations() {
+  closeChest();
+  $('#benchPanel').hidden = true;
+  $('#furnPanel').hidden = true;
+}
+
+// 제작 버튼 핸들러
+$('#benchRecipes').onclick = e => {
+  const b = e.target.closest('.rc');
+  if (b) { craft(BENCH_RECIPES[+b.dataset.br]); renderBenchUI(); renderInv(); }
+};
+$('#furnRecipes').onclick = e => {
+  const b = e.target.closest('.rc');
+  if (b) { craft(FURN_RECIPES[+b.dataset.fr]); renderFurnUI(); renderInv(); }
+};
+
+// 작업대/화로 인벤토리 슬롯 클릭 → 선택만 (아이템 이동은 드래그 없이 클릭 스왑)
+$('#benchGrid').onclick = e => {
+  const s = e.target.closest('.slot'); if (!s) return;
+  const i = +s.dataset.i;
+  [inv[i], inv[sel]] = [inv[sel], inv[i]]; dirty = true;
+  renderBenchUI(); renderInv();
+};
+$('#furnGrid').onclick = e => {
+  const s = e.target.closest('.slot'); if (!s) return;
+  const i = +s.dataset.i;
+  [inv[i], inv[sel]] = [inv[sel], inv[i]]; dirty = true;
+  renderFurnUI(); renderInv();
+};
+
+// ★ 상자 클릭: 상자↔가방 아이템 이동
+$('#chestGrid').onclick = e => {
+  const s = e.target.closest('[data-ci]'); if (!s) return;
+  const ci = +s.dataset.ci;
+  const items = CHESTS.get(chestOpenKey); if (!items) return;
+  const cur = items[ci];
+  if (cur) {
+    // 상자 → 가방
+    let added = false;
+    for (const invIt of inv) {
+      if (invIt && invIt.id === cur.id && !(IT[cur.id] && IT[cur.id].slot)) { invIt.n += cur.n; added = true; break; }
+    }
+    if (!added) {
+      const idx = inv.indexOf(null);
+      if (idx >= 0) { inv[idx] = cur; added = true; }
+    }
+    if (added) { items[ci] = null; dirty = true; syncChest(chestOpenKey); }
+  } else {
+    // 가방 → 상자 (선택 슬롯)
+    const it = inv[sel];
+    if (it) {
+      let added = false;
+      for (let k = 0; k < items.length; k++) {
+        if (items[k] && items[k].id === it.id && !(IT[it.id] && IT[it.id].slot)) { items[k].n += it.n; added = true; break; }
+      }
+      if (!added) {
+        const idx = items.indexOf(null);
+        if (idx >= 0) { items[idx] = it; added = true; }
+      }
+      if (added) { inv[sel] = null; dirty = true; syncChest(chestOpenKey); }
+    }
+  }
+  renderChestUI(); renderInv();
+};
+$('#chestInvGrid').onclick = e => {
+  const s = e.target.closest('.slot'); if (!s) return;
+  sel = +s.dataset.i; dirty = true;
+  renderChestUI(); renderInv();
+};
+
 let toastT=0,hintT=0;
 function toast(m){const e=$('#toast');e.textContent=m;e.classList.add('on');clearTimeout(toastT);toastT=setTimeout(()=>e.classList.remove('on'),2200)}
 function hint(m){if(performance.now()-hintT>1800){hintT=performance.now();toast(m)}}
 function updateHud(){
   const tt=time/DAY%1,hr=(6+tt*24)%24|0,mn=((6+tt*24)%1*60)|0,dp=Math.max(0,Math.round(P.y+P.h-heights[Math.floor(P.x)]));
-  // ★ 플레이어 수 통일: 자기 자신(1) + remotes.size
   const cnt = MP.active ? (1 + MP.remotes.size) : 0;
   $('#hud').innerHTML=`${dim?'에테르 차원':BIOME[biomeAt(Math.floor(P.x))]} · 깊이 ${dp}m · ${String(hr).padStart(2,'0')}:${String(mn).padStart(2,'0')} ${tt<.5?'☀️':'🌙'}${MP.active?`<br>👥 ${cnt}명 · ${MP.isHost?'호스트':'클라이언트'} · ${MP.roomCode||''}`:''}<br>🛡 방어력 ${defense()}`;
 }
-function togglePanel(){panelOpen=!panelOpen;$('#panel').hidden=!panelOpen;dirty=true}
+function togglePanel(){
+  closeAllStations();
+  panelOpen=!panelOpen;$('#panel').hidden=!panelOpen;dirty=true;
+  if (panelOpen) renderInv();
+}
 $('#hotbar').onclick=e=>{const s=e.target.closest('.slot');if(s){sel=+s.dataset.i;dirty=true}};
 $('#grid').onclick=e=>{const s=e.target.closest('.slot');if(!s)return;const i=+s.dataset.i,it=inv[i]&&IT[inv[i].id];
-  if(it&&it.slot)[eq[it.slot],inv[i]]=[inv[i],eq[it.slot]];else[inv[i],inv[sel]]=[inv[sel],inv[i]];dirty=true};
+  if(it&&it.slot)[eq[it.slot],inv[i]]=[inv[i],eq[it.slot]];else[inv[i],inv[sel]]=[inv[sel],inv[i]];dirty=true;renderInv()};
 $('#eq').onclick=e=>{const d=e.target.closest('[data-e]'),k=d&&d.dataset.e;if(!k)return;
   if(eq[k]){if(inv.includes(null)){addItem(eq[k].id,eq[k].n);eq[k]=null}}
   else if((k==='R'||k==='L')&&inv[sel]){eq[k]=inv[sel];inv[sel]=null}
-  dirty=true};
-$('#recipes').onclick=e=>{const b=e.target.closest('.rc');if(b)craft(+b.dataset.r)};
+  dirty=true;renderInv()};
+$('#recipes').onclick=e=>{const b=e.target.closest('.rc');if(b){craft(BASIC_RECIPES[+b.dataset.r]);renderInv()}};
 
 /* ============ 9. 저장 / 불러오기 ============ */
 const KEY='aether-save-v2';
@@ -777,26 +990,46 @@ const hasSave=()=>{try{return!!localStorage.getItem(KEY)}catch(e){return false}}
 function rle(a){const o=[];let v=a[0],c=1;for(let i=1;i<a.length;i++){if(a[i]===v&&c<65535)c++;else{o.push(v,c);v=a[i];c=1}}o.push(v,c);return o}
 function unrle(r){const a=new Uint8Array(W*H);let i=0;for(let k=0;k<r.length;k+=2){a.fill(r[k],i,i+r[k+1]);i+=r[k+1]}return a}
 const pack=d=>d&&{rle:rle(d.world),wl:rle(d.wl),hs:d.heights};
-function save(auto){try{sync();localStorage.setItem(KEY,JSON.stringify({v:3,seed,time,sel,dim,port:PORT,inv,eq,p:[P.x,P.y],...pack(DIM[0]),ae:pack(DIM[1])}));if(!auto)toast('월드를 저장했습니다 💾')}
-  catch(e){toast('저장에 실패했습니다')}}
-function load(){try{const s=JSON.parse(localStorage.getItem(KEY));if(!s||s.v<2||s.v>3)return false;
-  const un=o=>o&&{world:unrle(o.rle),wl:unrle(o.wl),heights:o.hs};
-  seed=s.seed;DIM[0]=un(s);DIM[1]=un(s.ae)||null;PORT[0]=s.port?s.port[0]:null;PORT[1]=s.port?s.port[1]:null;dim=s.dim||0;
-  ({world,wl,heights}=DIM[dim]);scanTorches();
-  inv.splice(0,inv.length,...s.inv);for(const k in eq)eq[k]=null;Object.assign(eq,s.eq);sel=s.sel;time=s.time;Object.assign(P,{x:s.p[0],y:s.p[1],vx:0,vy:0});return true}
-  catch(e){console.error(e);return false}}
+function save(auto){
+  try{
+    sync();
+    const chests = [];
+    for (const [k, v] of CHESTS) chests.push([k, v]);
+    localStorage.setItem(KEY, JSON.stringify({
+      v:4, seed, time, sel, dim, port: PORT, inv, eq, p: [P.x, P.y],
+      chests,
+      ...pack(DIM[0]), ae: pack(DIM[1])
+    }));
+    if(!auto)toast('월드를 저장했습니다 💾');
+  } catch(e){ toast('저장에 실패했습니다'); }
+}
+function load(){
+  try{
+    const s=JSON.parse(localStorage.getItem(KEY));if(!s||s.v<2||s.v>4)return false;
+    const un=o=>o&&{world:unrle(o.rle),wl:unrle(o.wl),heights:o.hs};
+    seed=s.seed;DIM[0]=un(s);DIM[1]=un(s.ae)||null;
+    PORT[0]=s.port?s.port[0]:null;PORT[1]=s.port?s.port[1]:null;dim=s.dim||0;
+    ({world,wl,heights}=DIM[dim]);scanTorches();
+    inv.splice(0,inv.length,...s.inv);for(const k in eq)eq[k]=null;Object.assign(eq,s.eq);sel=s.sel;time=s.time;Object.assign(P,{x:s.p[0],y:s.p[1],vx:0,vy:0});
+    CHESTS.clear();
+    for (const [k, v] of (s.chests || [])) CHESTS.set(k, v);
+    return true;
+  }catch(e){console.error(e);return false}
+}
 
 /* ============ 10. 입력 / 메인 루프 ============ */
 let state='menu',last=0,acc=0,hudT=0,saveT=0;
 function showMenu(){$('#menu').hidden=false;$('#bResume').hidden=!world;$('#bLoad').disabled=!hasSave()}
 function startGame(){state='play';$('#menu').hidden=true;dirty=true;keys.KeyA=keys.KeyD=keys.KeyW=keys.Space=false}
-function toggleMenu(){if(!world)return;if(state==='play'){state='menu';save(true);showMenu()}else startGame()}
+function toggleMenu(){
+  if(!world)return;
+  if(state==='play'){state='menu';save(true);closeAllStations();panelOpen=false;$('#panel').hidden=true;showMenu();}
+  else startGame();
+}
 $('#bNew').onclick=()=>{const v=parseInt($('#seed').value);generate(isNaN(v)?Math.random()*1e9|0:v);resetPlayer();inv.fill(null);for(const k in eq)eq[k]=null;sel=0;time=DAY*.08;startGame();toast('통나무 → 판자 → 작업대 → 나무 도구 순으로 만들어 보세요 (E)')};
 $('#bLoad').onclick=()=>{if(load())startGame();else toast('저장된 월드가 없습니다')};
 $('#bResume').onclick=startGame;$('#bSave').onclick=()=>save();$('#bMenu').onclick=toggleMenu;
 
-// ★ 로케이터 토글
-MP.locate = true;
 $('#bLoc').onclick = () => {
   MP.locate = !MP.locate;
   $('#bLoc').style.opacity = MP.locate ? '1' : '.4';
@@ -823,7 +1056,11 @@ $('#joinCode').addEventListener('keydown', e => { if (e.key === 'Enter') $('#bJo
 addEventListener('keydown',e=>{
   if(['Space','ArrowUp','ArrowDown','Tab'].includes(e.code))e.preventDefault();
   keys[e.code]=true;if(e.repeat)return;
-  if(e.code==='Escape')return toggleMenu();
+  if(e.code==='Escape'){
+    // ★ Esc: 열린 패널 닫기 우선
+    if (!$('#benchPanel').hidden || !$('#furnPanel').hidden || !$('#chestPanel').hidden) { closeAllStations(); return; }
+    return toggleMenu();
+  }
   if(e.code==='KeyT'&&MP.active&&!MP.inputMode){
     e.preventDefault();
     MP.inputMode=true;
@@ -885,7 +1122,7 @@ function loop(now){
     mpTick(dt);
     saveT+=dt;hudT+=dt;
     if(saveT>30){saveT=0;save(true)}
-    if(dirty){renderInv();dirty=false}
+    if(dirty){renderInv();dirty=false;if(chestOpenKey)renderChestUI();if(!$('#benchPanel').hidden)renderBenchUI();if(!$('#furnPanel').hidden)renderFurnUI();}
     if(hudT>.25){hudT=0;updateHud()}}
   render()}
 resize();showMenu();renderInv();requestAnimationFrame(loop);
